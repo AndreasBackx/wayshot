@@ -2,9 +2,12 @@ use std::{
     env,
     error::Error,
     io::{stdout, BufWriter, Cursor, Write},
-    process::exit,
+    process::{exit, Command},
+    thread::sleep,
+    time,
 };
 
+use image::imageops;
 use libwayshot::WayshotConnection;
 
 mod clap;
@@ -22,7 +25,8 @@ where
         .with_prompt("Choose Screen")
         .default(0)
         .items(ouputs)
-        .interact() else {
+        .interact()
+    else {
         return None;
     };
     Some(selection)
@@ -83,7 +87,36 @@ fn main() -> Result<(), Box<dyn Error>> {
         cursor_overlay = true;
     }
 
-    let image_buffer = if let Some(slurp_region) = args.get_one::<String>("slurp") {
+    let image_buffer = if let Some(command) = args.get_one::<String>("command") {
+        let freeze_frame_shell = wayshot_conn.freeze(cursor_overlay)?;
+
+        sleep(time::Duration::from_millis(1000));
+
+        let mut image = freeze_frame_shell.image;
+        // freeze_frame_shell.frame_
+
+        // let mut fullscreen_image = wayshot_conn.screenshot_all(cursor_overlay)?;
+
+        // Show screenshot.
+        let cmds = command.split(' ').collect::<Vec<&str>>();
+        let slurp_region =
+            String::from_utf8(Command::new(cmds[0]).args(&cmds[1..]).output()?.stdout)?;
+        if let Some(region) = utils::parse_geometry(&slurp_region) {
+            // wayshot_conn.screenshot(region, cursor_overlay)?
+            eprintln!("Region: {region:#?}");
+            imageops::crop(
+                &mut image,
+                region.x_coordinate as u32,
+                region.y_coordinate as u32,
+                region.width as u32,
+                region.height as u32,
+            )
+            .to_image()
+        } else {
+            log::error!("Invalid geometry specification");
+            exit(1);
+        }
+    } else if let Some(slurp_region) = args.get_one::<String>("slurp") {
         if let Some(region) = utils::parse_geometry(slurp_region) {
             wayshot_conn.screenshot(region, cursor_overlay)?
         } else {

@@ -15,8 +15,16 @@ pub fn set_flags() -> Command {
         .arg(
             arg!(-s --slurp <GEOMETRY>)
                 .required(false)
+                .conflicts_with("command")
                 .action(ArgAction::Set)
                 .help("Choose a portion of your display to screenshot using slurp"),
+        )
+        .arg(
+            arg!(-S --command <COMMAND>)
+                .required(false)
+                .conflicts_with("slurp")
+                .action(ArgAction::Set)
+                .help("Run slurp or a similar command inside of wayshot so a moment capture can be made and then cropped to the selection"),
         )
         .arg(
             arg!(-f - -file <FILE_PATH>)

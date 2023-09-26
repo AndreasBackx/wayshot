@@ -13,27 +13,40 @@ mod screencopy;
 use std::{
     cmp,
     fs::File,
-    os::{fd::AsRawFd, unix::prelude::FromRawFd},
+    os::{
+        fd::{AsRawFd, RawFd},
+        unix::prelude::FromRawFd,
+    },
     process::exit,
     sync::atomic::{AtomicBool, Ordering},
 };
 
+use dispatch::LayerShellState;
 use image::{imageops::overlay, DynamicImage, RgbaImage};
 use memmap2::MmapMut;
 use wayland_client::{
     globals::{registry_queue_init, GlobalList},
     protocol::{
+        wl_buffer::WlBuffer,
+        wl_compositor::WlCompositor,
         wl_output::{Transform, WlOutput},
         wl_shm::{self, WlShm},
+        wl_shm_pool::WlShmPool,
     },
     Connection,
 };
 use wayland_protocols::xdg::xdg_output::zv1::client::{
     zxdg_output_manager_v1::ZxdgOutputManagerV1, zxdg_output_v1::ZxdgOutputV1,
 };
-use wayland_protocols_wlr::screencopy::v1::client::{
-    zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
-    zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
+use wayland_protocols_wlr::{
+    layer_shell::v1::client::{
+        zwlr_layer_shell_v1::{Layer, ZwlrLayerShellV1},
+        zwlr_layer_surface_v1::Anchor,
+    },
+    screencopy::v1::client::{
+        zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
+        zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
+    },
 };
 
 use crate::{
@@ -83,6 +96,59 @@ pub struct WayshotConnection {
     pub conn: Connection,
     pub globals: GlobalList,
     output_infos: Vec<OutputInfo>,
+}
+
+pub struct FreezeBufferPool {
+    buffer: WlBuffer,
+    shm_pool: WlShmPool,
+}
+
+pub struct FreezeFrameFormat {
+    buffer_pool: FreezeBufferPool,
+    frame_format: FrameFormat,
+}
+
+pub struct FreezeFrameCopy {
+    buffer_pool: FreezeBufferPool,
+    frame_copy: FrameCopy,
+}
+
+pub struct FreezeLayerShell {
+    inner_copy: FreezeFrameCopy,
+    layer_shell: ZwlrLayerShellV1,
+}
+
+impl Drop for FreezeBufferPool {
+    fn drop(&mut self) {
+        eprintln!("Dropping buffer pool");
+        self.buffer.destroy();
+        self.shm_pool.destroy();
+    }
+}
+
+pub struct FreezeRgbaImage {
+    pub image: RgbaImage,
+    inner_shell: FreezeLayerShell,
+}
+
+// impl Drop for FreezeFrameFormat {
+//     fn drop(&mut self) {
+//         drop(&mut self.buffer_pool);
+//     }
+// }
+
+// impl Drop for FreezeFrameCopy {
+//     fn drop(&mut self) {
+//         drop(&mut self.buffer_pool);
+//     }
+// }
+
+impl Drop for FreezeLayerShell {
+    fn drop(&mut self) {
+        eprintln!("Dropping layer shell");
+        // drop(self.inner_copy);
+        self.layer_shell.destroy();
+    }
 }
 
 impl WayshotConnection {
@@ -172,7 +238,101 @@ impl WayshotConnection {
         fd: T,
         capture_region: Option<CaptureRegion>,
     ) -> Result<FrameFormat> {
-        self.capture_output_frame_shm_fd_inner(cursor_overlay, output, fd, None, capture_region)
+        let freeze_frame_format = self.capture_output_frame_shm_fd_inner(
+            cursor_overlay,
+            output,
+            fd,
+            None,
+            capture_region,
+        )?;
+
+        // buffer.destroy();
+        // shm_pool.destroy();
+
+        Ok(freeze_frame_format.frame_format)
+    }
+
+    fn overlay_image_shell_wayland(
+        &self,
+        output_infos: &Vec<OutputInfo>,
+        cursor_overlay: bool,
+    ) -> Result<FreezeLayerShell> {
+        let mut state = LayerShellState { configured: false };
+        let mut event_queue = self.conn.new_event_queue::<LayerShellState>();
+        let qh = event_queue.handle();
+
+        let compositor = match self.globals.bind::<WlCompositor, _, _>(&qh, 1..=1, ()) {
+            Ok(x) => x,
+            Err(e) => {
+                log::error!(
+                    "Failed to create compositor Does your compositor implement WlCompositor?"
+                );
+                log::error!("err: {e}");
+                return Err(Error::ProtocolNotFound(
+                    "WlCompositor not found".to_string(),
+                ));
+            }
+        };
+        let layer_shell = match self.globals.bind::<ZwlrLayerShellV1, _, _>(&qh, 1..=1, ()) {
+            Ok(x) => x,
+            Err(e) => {
+                log::error!(
+                    "Failed to create layer shell. Does your compositor implement WlrLayerShellV1?"
+                );
+                log::error!("err: {e}");
+                return Err(Error::ProtocolNotFound(
+                    "WlrLayerShellV1 not found".to_string(),
+                ));
+            }
+        };
+
+        let surface = compositor.create_surface(&qh, ());
+
+        // TODO Do this for all of the output infos
+        // output_infos.map()
+        let layer_surface = layer_shell.get_layer_surface(
+            &surface,
+            Some(&output_info.wl_output),
+            Layer::Top,
+            "wayshot".to_string(),
+            &qh,
+            (),
+        );
+
+        let freeze_format_copy = self.capture_output_frame(
+            cursor_overlay as i32,
+            &output_info.wl_output,
+            output_info.transform,
+            None,
+        )?;
+
+        // Ignore exclusive zones.
+        layer_surface.set_exclusive_zone(-1);
+        layer_surface.set_anchor(Anchor::Top | Anchor::Left | Anchor::Right | Anchor::Bottom);
+        layer_surface.set_size(
+            freeze_format_copy.frame_copy.frame_format.width,
+            freeze_format_copy.frame_copy.frame_format.height,
+        );
+        // shell_surface.ack_configure();
+
+        // shell_surface.
+        // event_queue.blocking_dispatch(&mut state)?;
+
+        surface.commit();
+
+        while !state.configured {
+            event_queue.blocking_dispatch(&mut state)?;
+        }
+
+        surface.attach(Some(&freeze_format_copy.buffer_pool.buffer), 0, 0);
+        surface.commit();
+
+        event_queue.blocking_dispatch(&mut state)?;
+
+        Ok(FreezeLayerShell {
+            inner_copy: freeze_format_copy,
+            layer_shell,
+        })
     }
 
     fn capture_output_frame_shm_fd_inner<T: AsRawFd>(
@@ -182,7 +342,7 @@ impl WayshotConnection {
         fd: T,
         file: Option<&File>,
         capture_region: Option<CaptureRegion>,
-    ) -> Result<FrameFormat> {
+    ) -> Result<FreezeFrameFormat> {
         // Connecting to wayland environment.
         let mut state = CaptureFrameState {
             formats: Vec::new(),
@@ -292,9 +452,12 @@ impl WayshotConnection {
                         return Err(Error::FramecopyFailed);
                     }
                     FrameState::Finished => {
-                        buffer.destroy();
-                        shm_pool.destroy();
-                        return Ok(frame_format);
+                        // buffer.destroy();
+                        // shm_pool.destroy();
+                        return Ok(FreezeFrameFormat {
+                            buffer_pool: FreezeBufferPool { buffer, shm_pool },
+                            frame_format,
+                        });
                     }
                 }
             }
@@ -310,34 +473,44 @@ impl WayshotConnection {
         output: &WlOutput,
         transform: Transform,
         capture_region: Option<CaptureRegion>,
-    ) -> Result<FrameCopy> {
+    ) -> Result<FreezeFrameCopy> {
         // Create an in memory file and return it's file descriptor.
         let fd = create_shm_fd()?;
         // Create a writeable memory map backed by a mem_file.
         let mem_file = unsafe { File::from_raw_fd(fd.as_raw_fd()) };
 
-        let frame_format = self.capture_output_frame_shm_fd_inner(
+        let freeze_frame_format = self.capture_output_frame_shm_fd_inner(
             cursor_overlay,
             output,
             fd,
             Some(&mem_file),
             capture_region,
         )?;
+        // buffer.destroy();
+        // shm_pool.destroy();
 
         let mut frame_mmap = unsafe { MmapMut::map_mut(&mem_file)? };
         let data = &mut *frame_mmap;
-        let frame_color_type = if let Some(converter) = create_converter(frame_format.format) {
+        let frame_color_type = if let Some(converter) =
+            create_converter(freeze_frame_format.frame_format.format)
+        {
             converter.convert_inplace(data)
         } else {
-            log::error!("Unsupported buffer format: {:?}", frame_format.format);
+            log::error!(
+                "Unsupported buffer format: {:?}",
+                freeze_frame_format.frame_format.format
+            );
             log::error!("You can send a feature request for the above format to the mailing list for wayshot over at https://sr.ht/~shinyzenith/wayshot.");
             return Err(Error::NoSupportedBufferFormat);
         };
-        Ok(FrameCopy {
-            frame_format,
-            frame_color_type,
-            frame_mmap,
-            transform,
+        Ok(FreezeFrameCopy {
+            buffer_pool: freeze_frame_format.buffer_pool,
+            frame_copy: FrameCopy {
+                frame_format: freeze_frame_format.frame_format,
+                frame_color_type,
+                frame_mmap,
+                transform,
+            },
         })
     }
 
@@ -387,12 +560,13 @@ impl WayshotConnection {
         }
 
         for intersecting_output in intersecting_outputs {
-            framecopys.push(self.capture_output_frame(
+            let freeze_frame_copy = self.capture_output_frame(
                 cursor_overlay,
                 &intersecting_output.output,
                 intersecting_output.transform,
                 Some(intersecting_output.region),
-            )?);
+            )?;
+            framecopys.push(freeze_frame_copy.frame_copy);
         }
         Ok((
             framecopys,
@@ -456,7 +630,7 @@ impl WayshotConnection {
             output_info.transform,
             None,
         )?;
-        let dynamic_image: DynamicImage = (&frame_copy).try_into()?;
+        let dynamic_image: DynamicImage = (&frame_copy.frame_copy).try_into()?;
         Ok(dynamic_image.into_rgba8())
     }
 
@@ -502,5 +676,16 @@ impl WayshotConnection {
     /// Take a screenshot from all accessible outputs.
     pub fn screenshot_all(&self, cursor_overlay: bool) -> Result<RgbaImage> {
         self.screenshot_outputs(self.get_all_outputs(), cursor_overlay)
+    }
+
+    pub fn freeze(&self, cursor_overlay: bool) -> Result<FreezeRgbaImage> {
+        let freeze_layer_shell =
+            self.overlay_image_shell_wayland(self.get_all_outputs(), cursor_overlay)?;
+
+        let dynamic_image: DynamicImage = (&freeze_layer_shell.inner_copy.frame_copy).try_into()?;
+        Ok(FreezeRgbaImage {
+            image: dynamic_image.into_rgba8(),
+            inner_shell: freeze_layer_shell,
+        })
     }
 }
