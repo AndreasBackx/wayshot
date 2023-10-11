@@ -19,9 +19,11 @@ use std::{
     thread,
 };
 
-use image::{imageops::overlay, RgbaImage};
+use image::{
+    imageops::{overlay, replace},
+    RgbaImage,
+};
 use memmap2::MmapMut;
-use tracing::info;
 use wayland_client::{
     globals::{registry_queue_init, GlobalList},
     protocol::{
@@ -501,7 +503,6 @@ impl WayshotConnection {
                     })
                 })
                 .map(|intersecting_output| {
-                    info!("Capturing output: {intersecting_output:?}");
                     scope.spawn(move || {
                         self.capture_output_frame(
                             cursor_overlay,
@@ -529,11 +530,8 @@ impl WayshotConnection {
         capture_region: CaptureRegion,
         cursor_overlay: bool,
     ) -> Result<RgbaImage> {
-        info!("{capture_region:?}");
-        info!("{cursor_overlay:?}");
         let (frame_copies, (width, height)) =
             self.create_frame_copy(capture_region, cursor_overlay)?;
-        info!("Frame copies taken!");
 
         thread::scope(|scope| {
             let rotate_join_handles = frame_copies
@@ -542,7 +540,6 @@ impl WayshotConnection {
                     scope.spawn(move || {
                         let transform = frame_copy.transform;
                         let image = frame_copy.try_into()?;
-                        tracing::debug!("Rotating image");
                         Ok(image_util::rotate_image_buffer(
                             image,
                             transform,
@@ -580,15 +577,6 @@ impl WayshotConnection {
                     tracing::error!("Provided capture region doesn't intersect with any outputs!");
                     Error::NoOutputs
                 })?
-            // .try_reduce(|mut merged_image, image| {
-            //     tracing::info!("OVERLAYING");
-            //     overlay(&mut merged_image, &image, 0, 0);
-            //     Ok(merged_image)
-            // })
-            // .ok_or_else(|| {
-            //     tracing::error!("Provided capture region doesn't intersect with any outputs!");
-            //     Error::NoOutputs
-            // })?
         })
     }
 

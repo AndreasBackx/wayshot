@@ -72,16 +72,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let wayshot_conn = WayshotConnection::new()?;
-    let (frame_copies, (width, height)) = wayshot_conn.create_frame_copy(
-        CaptureRegion {
-            x_coordinate: 0,
-            y_coordinate: 0,
-            width: 5440,
-            height: 2590,
-        },
-        false,
-    )?;
-    exit(0);
 
     if args.get_flag("listoutputs") {
         let valid_outputs = wayshot_conn.get_all_outputs();

@@ -27,21 +27,13 @@ pub struct FrameFormat {
 
 fn create_image_buffer<P>(
     frame_format: &FrameFormat,
-    frame_mmap: MmapMut,
+    frame_mmap: &MmapMut,
 ) -> Result<ImageBuffer<P, Vec<P::Subpixel>>>
 where
     P: Pixel<Subpixel = u8>,
 {
-    // let ptr = frame_mmap.as_mut_ptr();
-    // let len = frame_mmap.len();
-
-    // let mmap_vec = unsafe { Vec::from_raw_parts(ptr, len, len) };
-    ImageBuffer::from_raw(
-        frame_format.width,
-        frame_format.height,
-        frame_mmap[..].to_vec(),
-    )
-    .ok_or(Error::BufferTooSmall)
+    ImageBuffer::from_vec(frame_format.width, frame_format.height, frame_mmap.to_vec())
+        .ok_or(Error::BufferTooSmall)
 }
 
 /// The copied frame comprising of the FrameFormat, ColorType (Rgba8), and a memory backed shm
@@ -60,7 +52,7 @@ impl TryFrom<FrameCopy> for RgbaImage {
     fn try_from(value: FrameCopy) -> Result<Self> {
         Ok(match value.frame_color_type {
             ColorType::Rgb8 | ColorType::Rgba8 => {
-                create_image_buffer(&value.frame_format, value.frame_mmap)?
+                create_image_buffer(&value.frame_format, &value.frame_mmap)?
             }
             _ => return Err(Error::InvalidColor),
         })
