@@ -10,17 +10,18 @@ mod image_util;
 pub mod output;
 mod screencopy;
 
-use rayon::prelude::*;
 use std::{
     cmp,
     fs::File,
     os::fd::AsFd,
     process::exit,
     sync::atomic::{AtomicBool, Ordering},
+    thread,
 };
 
 use image::{imageops::overlay, RgbaImage};
 use memmap2::MmapMut;
+use tracing::info;
 use wayland_client::{
     globals::{registry_queue_init, GlobalList},
     protocol::{
@@ -66,6 +67,7 @@ pub struct CaptureRegion {
     pub height: i32,
 }
 
+#[derive(Debug)]
 struct IntersectingOutput {
     output: WlOutput,
     region: CaptureRegion,
@@ -295,7 +297,7 @@ impl WayshotConnection {
 
     fn capture_output_frame_shm_from_file(
         &self,
-        cursor_overlay: i32,
+        cursor_overlay: bool,
         output: &WlOutput,
         file: &File,
         capture_region: Option<CaptureRegion>,
@@ -329,7 +331,7 @@ impl WayshotConnection {
         // Capture output.
         let frame: ZwlrScreencopyFrameV1 = if let Some(region) = capture_region {
             screencopy_manager.capture_output_region(
-                cursor_overlay,
+                cursor_overlay as i32,
                 output,
                 region.x_coordinate,
                 region.y_coordinate,
@@ -339,7 +341,7 @@ impl WayshotConnection {
                 (),
             )
         } else {
-            screencopy_manager.capture_output(cursor_overlay, output, &qh, ())
+            screencopy_manager.capture_output(cursor_overlay as i32, output, &qh, ())
         };
 
         // Empty internal event buffer until buffer_done is set to true which is when the Buffer done
@@ -422,7 +424,7 @@ impl WayshotConnection {
     /// Get a FrameCopy instance with screenshot pixel data for any wl_output object.
     fn capture_output_frame(
         &self,
-        cursor_overlay: i32,
+        cursor_overlay: bool,
         output: &WlOutput,
         transform: Transform,
         capture_region: Option<CaptureRegion>,
@@ -456,56 +458,67 @@ impl WayshotConnection {
         })
     }
 
-    fn create_frame_copy(
+    pub fn create_frame_copy(
         &self,
         capture_region: CaptureRegion,
-        cursor_overlay: i32,
+        cursor_overlay: bool,
     ) -> Result<Frame> {
-        let frame_copies = self
-            .get_all_outputs()
-            .into_par_iter()
-            .filter_map(|output| {
-                let x1: i32 = cmp::max(output.dimensions.x, capture_region.x_coordinate);
-                let y1: i32 = cmp::max(output.dimensions.y, capture_region.y_coordinate);
-                let x2: i32 = cmp::min(
-                    output.dimensions.x + output.dimensions.width,
-                    capture_region.x_coordinate + capture_region.width,
-                );
-                let y2: i32 = cmp::min(
-                    output.dimensions.y + output.dimensions.height,
-                    capture_region.y_coordinate + capture_region.height,
-                );
+        let frame_copies = thread::scope(|scope| -> Result<_> {
+            let join_handles = self
+                .get_all_outputs()
+                .into_iter()
+                .filter_map(|output| {
+                    let x1: i32 = cmp::max(output.dimensions.x, capture_region.x_coordinate);
+                    let y1: i32 = cmp::max(output.dimensions.y, capture_region.y_coordinate);
+                    let x2: i32 = cmp::min(
+                        output.dimensions.x + output.dimensions.width,
+                        capture_region.x_coordinate + capture_region.width,
+                    );
+                    let y2: i32 = cmp::min(
+                        output.dimensions.y + output.dimensions.height,
+                        capture_region.y_coordinate + capture_region.height,
+                    );
 
-                let width = x2 - x1;
-                let height = y2 - y1;
+                    let width = x2 - x1;
+                    let height = y2 - y1;
 
-                if width <= 0 || height <= 0 {
-                    return None;
-                }
+                    if width <= 0 || height <= 0 {
+                        return None;
+                    }
 
-                let true_x = capture_region.x_coordinate - output.dimensions.x;
-                let true_y = capture_region.y_coordinate - output.dimensions.y;
-                let true_region = CaptureRegion {
-                    x_coordinate: true_x,
-                    y_coordinate: true_y,
-                    width: capture_region.width,
-                    height: capture_region.height,
-                };
-                Some(IntersectingOutput {
-                    output: output.wl_output.clone(),
-                    region: true_region,
-                    transform: output.transform,
+                    let true_x = capture_region.x_coordinate - output.dimensions.x;
+                    let true_y = capture_region.y_coordinate - output.dimensions.y;
+                    let true_region = CaptureRegion {
+                        x_coordinate: true_x,
+                        y_coordinate: true_y,
+                        width: capture_region.width,
+                        height: capture_region.height,
+                    };
+                    Some(IntersectingOutput {
+                        output: output.wl_output.clone(),
+                        region: true_region,
+                        transform: output.transform,
+                    })
                 })
-            })
-            .map(|intersecting_output| {
-                self.capture_output_frame(
-                    cursor_overlay,
-                    &intersecting_output.output,
-                    intersecting_output.transform,
-                    Some(intersecting_output.region),
-                )
-            })
-            .collect::<Result<_>>()?;
+                .map(|intersecting_output| {
+                    info!("Capturing output: {intersecting_output:?}");
+                    scope.spawn(move || {
+                        self.capture_output_frame(
+                            cursor_overlay,
+                            &intersecting_output.output,
+                            intersecting_output.transform,
+                            Some(intersecting_output.region),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            join_handles
+                .into_iter()
+                .map(|join_handle| join_handle.join())
+                .flatten()
+                .collect::<Result<_>>()
+        })?;
 
         Ok((frame_copies, (capture_region.width, capture_region.height)))
     }
@@ -516,30 +529,67 @@ impl WayshotConnection {
         capture_region: CaptureRegion,
         cursor_overlay: bool,
     ) -> Result<RgbaImage> {
+        info!("{capture_region:?}");
+        info!("{cursor_overlay:?}");
         let (frame_copies, (width, height)) =
-            self.create_frame_copy(capture_region, cursor_overlay as i32)?;
+            self.create_frame_copy(capture_region, cursor_overlay)?;
+        info!("Frame copies taken!");
 
-        frame_copies
-            .par_iter()
-            .map(|frame_copy| -> Result<_> {
-                let image = frame_copy.try_into()?;
-                tracing::info!("ROTATING");
-                Ok(image_util::rotate_image_buffer(
-                    image,
-                    frame_copy.transform,
-                    width as u32,
-                    height as u32,
-                ))
-            })
-            .try_reduce_with(|mut merged_image, image| {
-                tracing::info!("OVERLAYING");
-                overlay(&mut merged_image, &image, 0, 0);
-                Ok(merged_image)
-            })
-            .ok_or_else(|| {
-                tracing::error!("Provided capture region doesn't intersect with any outputs!");
-                Error::NoOutputs
-            })?
+        thread::scope(|scope| {
+            let rotate_join_handles = frame_copies
+                .into_iter()
+                .map(|frame_copy| {
+                    scope.spawn(move || {
+                        let transform = frame_copy.transform;
+                        let image = frame_copy.try_into()?;
+                        tracing::debug!("Rotating image");
+                        Ok(image_util::rotate_image_buffer(
+                            image,
+                            transform,
+                            width as u32,
+                            height as u32,
+                        ))
+                    })
+                })
+                .collect::<Vec<_>>();
+
+            rotate_join_handles
+                .into_iter()
+                .map(|join_handle| join_handle.join())
+                .flatten()
+                .fold(
+                    None,
+                    |possible_overlayed_image_or_error: Option<Result<_>>, image: Result<_>| {
+                        if let Some(overlayed_image_or_error) = possible_overlayed_image_or_error {
+                            if let Ok(mut overlayed_image) = overlayed_image_or_error {
+                                if let Ok(image) = image {
+                                    overlay(&mut overlayed_image, &image, 0, 0);
+                                    Some(Ok(overlayed_image))
+                                } else {
+                                    Some(image)
+                                }
+                            } else {
+                                Some(image)
+                            }
+                        } else {
+                            Some(image)
+                        }
+                    },
+                )
+                .ok_or_else(|| {
+                    tracing::error!("Provided capture region doesn't intersect with any outputs!");
+                    Error::NoOutputs
+                })?
+            // .try_reduce(|mut merged_image, image| {
+            //     tracing::info!("OVERLAYING");
+            //     overlay(&mut merged_image, &image, 0, 0);
+            //     Ok(merged_image)
+            // })
+            // .ok_or_else(|| {
+            //     tracing::error!("Provided capture region doesn't intersect with any outputs!");
+            //     Error::NoOutputs
+            // })?
+        })
     }
 
     /// shot one ouput
@@ -549,12 +599,12 @@ impl WayshotConnection {
         cursor_overlay: bool,
     ) -> Result<RgbaImage> {
         let frame_copy = self.capture_output_frame(
-            cursor_overlay as i32,
+            cursor_overlay,
             &output_info.wl_output,
             output_info.transform,
             None,
         )?;
-        (&frame_copy).try_into()
+        frame_copy.try_into()
     }
 
     /// Take a screenshot from all of the specified outputs.
