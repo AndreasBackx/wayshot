@@ -11,19 +11,21 @@ pub mod output;
 mod screencopy;
 
 use std::{
-    cmp,
     fs::File,
     os::fd::AsFd,
-    process::exit,
+    process::{exit, Command},
     sync::atomic::{AtomicBool, Ordering},
     thread,
 };
 
+use dispatch::LayerShellState;
 use image::{imageops::overlay, RgbaImage};
 use memmap2::MmapMut;
+use screencopy::FrameGuard;
 use wayland_client::{
     globals::{registry_queue_init, GlobalList},
     protocol::{
+        wl_compositor::WlCompositor,
         wl_output::{Transform, WlOutput},
         wl_shm::{self, WlShm},
     },
@@ -32,9 +34,15 @@ use wayland_client::{
 use wayland_protocols::xdg::xdg_output::zv1::client::{
     zxdg_output_manager_v1::ZxdgOutputManagerV1, zxdg_output_v1::ZxdgOutputV1,
 };
-use wayland_protocols_wlr::screencopy::v1::client::{
-    zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
-    zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
+use wayland_protocols_wlr::{
+    layer_shell::v1::client::{
+        zwlr_layer_shell_v1::{Layer, ZwlrLayerShellV1},
+        zwlr_layer_surface_v1::Anchor,
+    },
+    screencopy::v1::client::{
+        zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
+        zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
+    },
 };
 
 use crate::{
@@ -50,8 +58,6 @@ pub mod reexport {
     use wayland_client::protocol::wl_output;
     pub use wl_output::{Transform, WlOutput};
 }
-
-type Frame = (Vec<FrameCopy>, (i32, i32));
 
 /// Struct to store region capture details.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -174,18 +180,19 @@ impl WayshotConnection {
         cursor_overlay: i32,
         output: &WlOutput,
         fd: T,
-        capture_region: Option<CaptureRegion>,
-    ) -> Result<FrameFormat> {
+    ) -> Result<(FrameFormat, FrameGuard)> {
         let (state, event_queue, frame, frame_format) =
-            self.capture_output_frame_get_state(cursor_overlay, output, capture_region)?;
-        self.capture_output_frame_inner(state, event_queue, frame, frame_format, fd)
+            self.capture_output_frame_get_state(cursor_overlay, output)?;
+        let frame_guard =
+            self.capture_output_frame_inner(state, event_queue, frame, frame_format, fd)?;
+
+        Ok((frame_format, frame_guard))
     }
 
     fn capture_output_frame_get_state(
         &self,
         cursor_overlay: i32,
         output: &WlOutput,
-        capture_region: Option<CaptureRegion>,
     ) -> Result<(
         CaptureFrameState,
         EventQueue<CaptureFrameState>,
@@ -217,20 +224,7 @@ impl WayshotConnection {
         };
 
         // Capture output.
-        let frame: ZwlrScreencopyFrameV1 = if let Some(region) = capture_region {
-            screencopy_manager.capture_output_region(
-                cursor_overlay,
-                output,
-                region.x_coordinate,
-                region.y_coordinate,
-                region.width,
-                region.height,
-                &qh,
-                (),
-            )
-        } else {
-            screencopy_manager.capture_output(cursor_overlay, output, &qh, ())
-        };
+        let frame = screencopy_manager.capture_output(cursor_overlay, output, &qh, ());
 
         // Empty internal event buffer until buffer_done is set to true which is when the Buffer done
         // event is fired, aka the capture from the compositor is succesful.
@@ -277,7 +271,7 @@ impl WayshotConnection {
         frame: ZwlrScreencopyFrameV1,
         frame_format: FrameFormat,
         fd: T,
-    ) -> Result<FrameFormat> {
+    ) -> Result<FrameGuard> {
         // Connecting to wayland environment.
         let qh = event_queue.handle();
 
@@ -309,9 +303,7 @@ impl WayshotConnection {
                         return Err(Error::FramecopyFailed);
                     }
                     FrameState::Finished => {
-                        buffer.destroy();
-                        shm_pool.destroy();
-                        return Ok(frame_format);
+                        return Ok(FrameGuard { buffer, shm_pool });
                     }
                 }
             }
@@ -325,36 +317,35 @@ impl WayshotConnection {
         cursor_overlay: bool,
         output: &WlOutput,
         file: &File,
-        capture_region: Option<CaptureRegion>,
-    ) -> Result<FrameFormat> {
+    ) -> Result<(FrameFormat, FrameGuard)> {
         let (state, event_queue, frame, frame_format) =
-            self.capture_output_frame_get_state(cursor_overlay as i32, output, capture_region)?;
+            self.capture_output_frame_get_state(cursor_overlay as i32, output)?;
 
         // Bytes of data in the frame = stride * height.
         let frame_bytes = frame_format.stride * frame_format.height;
         file.set_len(frame_bytes as u64)?;
 
-        self.capture_output_frame_inner(state, event_queue, frame, frame_format, file)
+        let frame_guard =
+            self.capture_output_frame_inner(state, event_queue, frame, frame_format, file)?;
+
+        Ok((frame_format, frame_guard))
     }
 
     /// Get a FrameCopy instance with screenshot pixel data for any wl_output object.
-    fn capture_output_frame(
+    fn capture_frame_copy(
         &self,
         cursor_overlay: bool,
-        output: &WlOutput,
-        transform: Transform,
-        capture_region: Option<CaptureRegion>,
-    ) -> Result<FrameCopy> {
+        output_info: &OutputInfo,
+    ) -> Result<(FrameCopy, FrameGuard)> {
         // Create an in memory file and return it's file descriptor.
         let fd = create_shm_fd()?;
         // Create a writeable memory map backed by a mem_file.
         let mem_file = File::from(fd);
 
-        let frame_format = self.capture_output_frame_shm_from_file(
+        let (frame_format, frame_guard) = self.capture_output_frame_shm_from_file(
             cursor_overlay,
-            output,
+            &output_info.wl_output,
             &mem_file,
-            capture_region,
         )?;
 
         let mut frame_mmap = unsafe { MmapMut::map_mut(&mem_file)? };
@@ -366,63 +357,31 @@ impl WayshotConnection {
             tracing::error!("You can send a feature request for the above format to the mailing list for wayshot over at https://sr.ht/~shinyzenith/wayshot.");
             return Err(Error::NoSupportedBufferFormat);
         };
-        Ok(FrameCopy {
-            frame_format,
-            frame_color_type,
-            frame_mmap,
-            transform,
-        })
+        Ok((
+            FrameCopy {
+                frame_format,
+                frame_color_type,
+                frame_mmap,
+                transform: output_info.transform,
+            },
+            frame_guard,
+        ))
     }
 
-    pub fn create_frame_copy(
+    pub fn capture_frame_copies(
         &self,
-        capture_region: CaptureRegion,
         cursor_overlay: bool,
-    ) -> Result<Frame> {
+    ) -> Result<Vec<(FrameCopy, FrameGuard, OutputInfo)>> {
         let frame_copies = thread::scope(|scope| -> Result<_> {
             let join_handles = self
                 .get_all_outputs()
                 .into_iter()
-                .filter_map(|output| {
-                    let x1: i32 = cmp::max(output.dimensions.x, capture_region.x_coordinate);
-                    let y1: i32 = cmp::max(output.dimensions.y, capture_region.y_coordinate);
-                    let x2: i32 = cmp::min(
-                        output.dimensions.x + output.dimensions.width,
-                        capture_region.x_coordinate + capture_region.width,
-                    );
-                    let y2: i32 = cmp::min(
-                        output.dimensions.y + output.dimensions.height,
-                        capture_region.y_coordinate + capture_region.height,
-                    );
-
-                    let width = x2 - x1;
-                    let height = y2 - y1;
-
-                    if width <= 0 || height <= 0 {
-                        return None;
-                    }
-
-                    let true_x = capture_region.x_coordinate - output.dimensions.x;
-                    let true_y = capture_region.y_coordinate - output.dimensions.y;
-                    let true_region = CaptureRegion {
-                        x_coordinate: true_x,
-                        y_coordinate: true_y,
-                        width: capture_region.width,
-                        height: capture_region.height,
-                    };
-                    Some(IntersectingOutput {
-                        output: output.wl_output.clone(),
-                        region: true_region,
-                        transform: output.transform,
-                    })
-                })
-                .map(|intersecting_output| {
+                .map(|output_info| {
                     scope.spawn(move || {
-                        self.capture_output_frame(
-                            cursor_overlay,
-                            &intersecting_output.output,
-                            intersecting_output.transform,
-                            Some(intersecting_output.region),
+                        self.capture_frame_copy(cursor_overlay, output_info).map(
+                            |(frame_copy, frame_guard)| {
+                                (frame_copy, frame_guard, output_info.clone())
+                            },
                         )
                     })
                 })
@@ -435,7 +394,76 @@ impl WayshotConnection {
                 .collect::<Result<_>>()
         })?;
 
-        Ok((frame_copies, (capture_region.width, capture_region.height)))
+        Ok(frame_copies)
+    }
+
+    fn overlay_frames(&self, frames: &Vec<(FrameCopy, FrameGuard, OutputInfo)>) -> Result<()> {
+        let mut state = LayerShellState { configured: false };
+        let mut event_queue: EventQueue<LayerShellState> =
+            self.conn.new_event_queue::<LayerShellState>();
+        let qh = event_queue.handle();
+
+        let compositor = match self.globals.bind::<WlCompositor, _, _>(&qh, 1..=1, ()) {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to create compositor Does your compositor implement WlCompositor?"
+                );
+                tracing::error!("err: {e}");
+                return Err(Error::ProtocolNotFound(
+                    "WlCompositor not found".to_string(),
+                ));
+            }
+        };
+        let layer_shell = match self.globals.bind::<ZwlrLayerShellV1, _, _>(&qh, 1..=1, ()) {
+            Ok(x) => x,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to create layer shell. Does your compositor implement WlrLayerShellV1?"
+                );
+                tracing::error!("err: {e}");
+                return Err(Error::ProtocolNotFound(
+                    "WlrLayerShellV1 not found".to_string(),
+                ));
+            }
+        };
+
+        for (frame_copy, frame_guard, output_info) in frames {
+            let surface = compositor.create_surface(&qh, ());
+
+            let layer_surface = layer_shell.get_layer_surface(
+                &surface,
+                Some(&output_info.wl_output),
+                Layer::Top,
+                "wayshot".to_string(),
+                &qh,
+                (),
+            );
+
+            // Ignore exclusive zones.
+            layer_surface.set_exclusive_zone(-1);
+            layer_surface.set_anchor(Anchor::Top | Anchor::Left | Anchor::Right | Anchor::Bottom);
+            layer_surface.set_size(
+                frame_copy.frame_format.width,
+                frame_copy.frame_format.height,
+            );
+            // shell_surface.ack_configure();
+
+            // shell_surface.
+            // event_queue.blocking_dispatch(&mut state)?;
+
+            surface.commit();
+
+            while !state.configured {
+                event_queue.blocking_dispatch(&mut state)?;
+            }
+
+            surface.attach(Some(&frame_guard.buffer), 0, 0);
+            surface.commit();
+
+            event_queue.blocking_dispatch(&mut state)?;
+        }
+        Ok(())
     }
 
     /// Take a screenshot from the specified region.
@@ -443,14 +471,28 @@ impl WayshotConnection {
         &self,
         capture_region: CaptureRegion,
         cursor_overlay: bool,
+        freeze: bool,
     ) -> Result<RgbaImage> {
-        let (frame_copies, (width, height)) =
-            self.create_frame_copy(capture_region, cursor_overlay)?;
+        let frames = self.capture_frame_copies(cursor_overlay)?;
+        let (width, height) = (capture_region.width, capture_region.height);
+
+        if freeze {
+            self.overlay_frames(&frames)?;
+
+            String::from_utf8(
+                Command::new("slurp")
+                    // .args(&cmds[1..])
+                    .output()?
+                    .stdout,
+            )
+            .unwrap();
+            // TODO Select region
+        }
 
         thread::scope(|scope| {
-            let rotate_join_handles = frame_copies
+            let rotate_join_handles = frames
                 .into_iter()
-                .map(|frame_copy| {
+                .map(|(frame_copy, _, _)| {
                     scope.spawn(move || {
                         let transform = frame_copy.transform;
                         let image = frame_copy.try_into()?;
@@ -500,12 +542,7 @@ impl WayshotConnection {
         output_info: &OutputInfo,
         cursor_overlay: bool,
     ) -> Result<RgbaImage> {
-        let frame_copy = self.capture_output_frame(
-            cursor_overlay,
-            &output_info.wl_output,
-            output_info.transform,
-            None,
-        )?;
+        let (frame_copy, frame_guard) = self.capture_frame_copy(cursor_overlay, output_info)?;
         frame_copy.try_into()
     }
 
@@ -514,6 +551,7 @@ impl WayshotConnection {
         &self,
         outputs: &Vec<OutputInfo>,
         cursor_overlay: bool,
+        freeze: bool,
     ) -> Result<RgbaImage> {
         if outputs.is_empty() {
             return Err(Error::NoOutputs);
@@ -545,11 +583,15 @@ impl WayshotConnection {
             width: x2 - x1,
             height: y2 - y1,
         };
-        self.screenshot(capture_region, cursor_overlay)
+        self.screenshot(capture_region, cursor_overlay, freeze)
     }
 
     /// Take a screenshot from all accessible outputs.
     pub fn screenshot_all(&self, cursor_overlay: bool) -> Result<RgbaImage> {
-        self.screenshot_outputs(self.get_all_outputs(), cursor_overlay)
+        self.screenshot_outputs(self.get_all_outputs(), cursor_overlay, false)
+    }
+
+    pub fn screenshot_interactive(&self, cursor_overlay: bool) -> Result<RgbaImage> {
+        self.screenshot_outputs(self.get_all_outputs(), cursor_overlay, true)
     }
 }
