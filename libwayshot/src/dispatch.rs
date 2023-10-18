@@ -1,7 +1,9 @@
 use std::{
+    collections::HashSet,
     process::exit,
     sync::atomic::{AtomicBool, Ordering},
 };
+use tracing::{debug, trace};
 use wayland_client::{
     delegate_noop,
     globals::GlobalListContents,
@@ -61,16 +63,9 @@ impl Dispatch<WlRegistry, ()> for OutputCaptureState {
                         name: "".to_string(),
                         description: String::new(),
                         transform: wl_output::Transform::Normal,
-                        dimensions: OutputPositioning {
-                            x: 0,
-                            y: 0,
-                            width: 0,
-                            height: 0,
-                        },
-                        mode: WlOutputMode {
-                            width: 0,
-                            height: 0,
-                        },
+                        scale: 1,
+                        dimensions: OutputPositioning::default(),
+                        mode: WlOutputMode::default(),
                     });
                 } else {
                     tracing::error!("Ignoring a wl_output with version < 4.");
@@ -111,7 +106,11 @@ impl Dispatch<WlOutput, ()> for OutputCaptureState {
             } => {
                 output.transform = transform;
             }
-            _ => (),
+            wl_output::Event::Scale { factor } => {
+                output.scale = factor;
+            }
+            wl_output::Event::Done => {}
+            _ => {}
         }
     }
 }
@@ -239,7 +238,7 @@ impl wayland_client::Dispatch<wl_registry::WlRegistry, GlobalListContents> for W
 }
 
 pub struct LayerShellState {
-    pub configured: bool,
+    pub configured_outputs: HashSet<WlOutput>,
 }
 
 delegate_noop!(LayerShellState: ignore WlCompositor);
@@ -273,16 +272,16 @@ impl wayland_client::Dispatch<WlSurface, ()> for LayerShellState {
         conn: &Connection,
         qhandle: &QueueHandle<Self>,
     ) {
-        eprintln!("WlSurface event: {:?}", event);
+        debug!("WlSurface event: {:?}", event);
     }
 }
 
-impl wayland_client::Dispatch<ZwlrLayerSurfaceV1, ()> for LayerShellState {
+impl wayland_client::Dispatch<ZwlrLayerSurfaceV1, WlOutput> for LayerShellState {
     fn event(
         state: &mut Self,
         proxy: &ZwlrLayerSurfaceV1,
         event: <ZwlrLayerSurfaceV1 as wayland_client::Proxy>::Event,
-        data: &(),
+        data: &WlOutput,
         conn: &Connection,
         qhandle: &QueueHandle<Self>,
     ) {
@@ -292,13 +291,13 @@ impl wayland_client::Dispatch<ZwlrLayerSurfaceV1, ()> for LayerShellState {
                 width,
                 height,
             } => {
-                eprintln!("Configure");
-                state.configured = true;
+                debug!("Acking configure");
+                state.configured_outputs.insert(data.clone());
                 proxy.ack_configure(serial);
-                eprintln!("Configure acked");
+                trace!("Acked configure");
             }
             zwlr_layer_surface_v1::Event::Closed => {
-                eprintln!("Closed")
+                debug!("Closed")
             }
             _ => {}
         }

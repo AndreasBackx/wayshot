@@ -86,38 +86,38 @@ fn main() -> Result<(), Box<dyn Error>> {
         cursor_overlay = true;
     }
 
-    let image_buffer = wayshot_conn.screenshot_interactive(cursor_overlay)?;
+    // let image_buffer = wayshot_conn.screenshot_interactive(cursor_overlay)?;
 
-    // let image_buffer = if let Some(slurp_region) = args.get_one::<String>("slurp") {
-    //     if let Some(region) = utils::parse_geometry(slurp_region) {
-    //         wayshot_conn.screenshot(region, cursor_overlay, true)?
-    //     } else {
-    //         tracing::error!("Invalid geometry specification");
-    //         exit(1);
-    //     }
-    // } else if let Some(output_name) = args.get_one::<String>("output") {
-    //     let outputs = wayshot_conn.get_all_outputs();
-    //     if let Some(output) = outputs.iter().find(|output| &output.name == output_name) {
-    //         wayshot_conn.screenshot_single_output(output, cursor_overlay)?
-    //     } else {
-    //         tracing::error!("No output found!\n");
-    //         exit(1);
-    //     }
-    // } else if args.get_flag("chooseoutput") {
-    //     let outputs = wayshot_conn.get_all_outputs();
-    //     let output_names: Vec<String> = outputs
-    //         .iter()
-    //         .map(|display| display.name.to_string())
-    //         .collect();
-    //     if let Some(index) = select_ouput(&output_names) {
-    //         wayshot_conn.screenshot_single_output(&outputs[index], cursor_overlay)?
-    //     } else {
-    //         tracing::error!("No output found!\n");
-    //         exit(1);
-    //     }
-    // } else {
-    //     wayshot_conn.screenshot_all(cursor_overlay)?
-    // };
+    let image_buffer = if let Some(slurp_region) = args.get_one::<String>("slurp") {
+        if let Some(region) = utils::parse_geometry(slurp_region) {
+            wayshot_conn.screenshot(region, cursor_overlay, true)?
+        } else {
+            tracing::error!("Invalid geometry specification");
+            exit(1);
+        }
+    } else if let Some(output_name) = args.get_one::<String>("output") {
+        let outputs = wayshot_conn.get_all_outputs();
+        if let Some(output) = outputs.iter().find(|output| &output.name == output_name) {
+            wayshot_conn.screenshot_single_output(output, cursor_overlay)?
+        } else {
+            tracing::error!("No output found!\n");
+            exit(1);
+        }
+    } else if args.get_flag("chooseoutput") {
+        let outputs = wayshot_conn.get_all_outputs();
+        let output_names: Vec<String> = outputs
+            .iter()
+            .map(|display| display.name.to_string())
+            .collect();
+        if let Some(index) = select_ouput(&output_names) {
+            wayshot_conn.screenshot_single_output(&outputs[index], cursor_overlay)?
+        } else {
+            tracing::error!("No output found!\n");
+            exit(1);
+        }
+    } else {
+        wayshot_conn.screenshot_all(cursor_overlay)?
+    };
 
     if file_is_stdout {
         let stdout = stdout();

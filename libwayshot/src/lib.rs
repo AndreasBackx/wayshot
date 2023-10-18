@@ -11,6 +11,7 @@ pub mod output;
 mod screencopy;
 
 use std::{
+    collections::HashSet,
     fs::File,
     os::fd::AsFd,
     process::{exit, Command},
@@ -19,9 +20,13 @@ use std::{
 };
 
 use dispatch::LayerShellState;
-use image::{imageops::overlay, RgbaImage};
+use image::{
+    imageops::{overlay, replace},
+    RgbaImage,
+};
 use memmap2::MmapMut;
 use screencopy::FrameGuard;
+use tracing::{debug, span, Level};
 use wayland_client::{
     globals::{registry_queue_init, GlobalList},
     protocol::{
@@ -398,12 +403,14 @@ impl WayshotConnection {
     }
 
     fn overlay_frames(&self, frames: &Vec<(FrameCopy, FrameGuard, OutputInfo)>) -> Result<()> {
-        let mut state = LayerShellState { configured: false };
+        let mut state = LayerShellState {
+            configured_outputs: HashSet::new(),
+        };
         let mut event_queue: EventQueue<LayerShellState> =
             self.conn.new_event_queue::<LayerShellState>();
         let qh = event_queue.handle();
 
-        let compositor = match self.globals.bind::<WlCompositor, _, _>(&qh, 1..=1, ()) {
+        let compositor = match self.globals.bind::<WlCompositor, _, _>(&qh, 3..=3, ()) {
             Ok(x) => x,
             Err(e) => {
                 tracing::error!(
@@ -429,39 +436,49 @@ impl WayshotConnection {
         };
 
         for (frame_copy, frame_guard, output_info) in frames {
-            let surface = compositor.create_surface(&qh, ());
+            span!(
+                Level::DEBUG,
+                "overlay_frames::surface",
+                output = output_info.name.as_str()
+            )
+            .in_scope(|| -> Result<()> {
+                let surface = compositor.create_surface(&qh, ());
 
-            let layer_surface = layer_shell.get_layer_surface(
-                &surface,
-                Some(&output_info.wl_output),
-                Layer::Top,
-                "wayshot".to_string(),
-                &qh,
-                (),
-            );
+                let layer_surface = layer_shell.get_layer_surface(
+                    &surface,
+                    Some(&output_info.wl_output),
+                    Layer::Top,
+                    "wayshot".to_string(),
+                    &qh,
+                    output_info.wl_output.clone(),
+                );
 
-            // Ignore exclusive zones.
-            layer_surface.set_exclusive_zone(-1);
-            layer_surface.set_anchor(Anchor::Top | Anchor::Left | Anchor::Right | Anchor::Bottom);
-            layer_surface.set_size(
-                frame_copy.frame_format.width,
-                frame_copy.frame_format.height,
-            );
-            // shell_surface.ack_configure();
+                layer_surface.set_exclusive_zone(-1);
+                layer_surface.set_anchor(Anchor::Top | Anchor::Left);
+                layer_surface.set_size(
+                    frame_copy.frame_format.width,
+                    frame_copy.frame_format.height,
+                );
 
-            // shell_surface.
-            // event_queue.blocking_dispatch(&mut state)?;
+                debug!("Committing surface creation changes.");
+                surface.commit();
 
-            surface.commit();
+                debug!("Waiting for layer surface to be configured.");
+                while !state.configured_outputs.contains(&output_info.wl_output) {
+                    event_queue.blocking_dispatch(&mut state)?;
+                }
 
-            while !state.configured {
+                surface.set_buffer_transform(output_info.transform);
+                surface.set_buffer_scale(output_info.scale);
+                surface.attach(Some(&frame_guard.buffer), 0, 0);
+
+                debug!("Committing surface with attached buffer.");
+                surface.commit();
+
                 event_queue.blocking_dispatch(&mut state)?;
-            }
 
-            surface.attach(Some(&frame_guard.buffer), 0, 0);
-            surface.commit();
-
-            event_queue.blocking_dispatch(&mut state)?;
+                Ok(())
+            })?;
         }
         Ok(())
     }
@@ -479,13 +496,13 @@ impl WayshotConnection {
         if freeze {
             self.overlay_frames(&frames)?;
 
-            String::from_utf8(
-                Command::new("slurp")
-                    // .args(&cmds[1..])
-                    .output()?
-                    .stdout,
-            )
-            .unwrap();
+            // String::from_utf8(
+            //     Command::new("slurp")
+            //         // .args(&cmds[1..])
+            //         .output()?
+            //         .stdout,
+            // )
+            // .unwrap();
             // TODO Select region
         }
 
@@ -516,7 +533,7 @@ impl WayshotConnection {
                         if let Some(overlayed_image_or_error) = possible_overlayed_image_or_error {
                             if let Ok(mut overlayed_image) = overlayed_image_or_error {
                                 if let Ok(image) = image {
-                                    overlay(&mut overlayed_image, &image, 0, 0);
+                                    replace(&mut overlayed_image, &image, 0, 0);
                                     Some(Ok(overlayed_image))
                                 } else {
                                     Some(image)
