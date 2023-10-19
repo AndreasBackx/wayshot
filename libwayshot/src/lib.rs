@@ -22,7 +22,7 @@ use std::{
 use dispatch::LayerShellState;
 use image::{
     imageops::{overlay, replace},
-    RgbaImage,
+    ImageBuffer, Rgba, RgbaImage,
 };
 use memmap2::MmapMut;
 use screencopy::FrameGuard;
@@ -75,13 +75,6 @@ pub struct CaptureRegion {
     pub width: i32,
     /// Height of the capture area.
     pub height: i32,
-}
-
-#[derive(Debug)]
-struct IntersectingOutput {
-    output: WlOutput,
-    region: CaptureRegion,
-    transform: Transform,
 }
 
 /// Struct to store wayland connection and globals list.
@@ -172,7 +165,7 @@ impl WayshotConnection {
             tracing::error!("Compositor did not advertise any wl_output devices!");
             exit(1);
         }
-        tracing::debug!("Outputs detected: {:#?}", state.outputs);
+        tracing::trace!("Outputs detected: {:#?}", state.outputs);
         self.output_infos = state.outputs;
 
         Ok(())
@@ -228,7 +221,7 @@ impl WayshotConnection {
             }
         };
 
-        // Capture output.
+        debug!("Capturing output...");
         let frame = screencopy_manager.capture_output(cursor_overlay, output, &qh, ());
 
         // Empty internal event buffer until buffer_done is set to true which is when the Buffer done
@@ -237,7 +230,7 @@ impl WayshotConnection {
             event_queue.blocking_dispatch(&mut state)?;
         }
 
-        tracing::debug!(
+        tracing::trace!(
             "Received compositor frame buffer formats: {:#?}",
             state.formats
         );
@@ -256,7 +249,7 @@ impl WayshotConnection {
                 )
             })
             .copied();
-        tracing::debug!("Selected frame buffer format: {:#?}", frame_format);
+        tracing::trace!("Selected frame buffer format: {:#?}", frame_format);
 
         // Check if frame format exists.
         let frame_format = match frame_format {
@@ -337,6 +330,7 @@ impl WayshotConnection {
     }
 
     /// Get a FrameCopy instance with screenshot pixel data for any wl_output object.
+    #[tracing::instrument(skip_all, fields(output = output_info.name))]
     fn capture_frame_copy(
         &self,
         cursor_overlay: bool,
@@ -368,6 +362,10 @@ impl WayshotConnection {
                 frame_color_type,
                 frame_mmap,
                 transform: output_info.transform,
+                position: (
+                    output_info.dimensions.x as i64,
+                    output_info.dimensions.y as i64,
+                ),
             },
             frame_guard,
         ))
@@ -491,7 +489,7 @@ impl WayshotConnection {
         freeze: bool,
     ) -> Result<RgbaImage> {
         let frames = self.capture_frame_copies(cursor_overlay)?;
-        let (width, height) = (capture_region.width, capture_region.height);
+        let (width, height) = (capture_region.width as u32, capture_region.height as u32);
 
         if freeze {
             self.overlay_frames(&frames)?;
@@ -511,17 +509,21 @@ impl WayshotConnection {
                 .into_iter()
                 .map(|(frame_copy, _, _)| {
                     scope.spawn(move || {
-                        let transform = frame_copy.transform;
-                        let image = frame_copy.try_into()?;
-                        Ok(image_util::rotate_image_buffer(
-                            image,
-                            transform,
-                            width as u32,
-                            height as u32,
+                        let image = (&frame_copy).try_into()?;
+                        Ok((
+                            image_util::rotate_image_buffer(
+                                image,
+                                frame_copy.transform,
+                                frame_copy.frame_format.width,
+                                frame_copy.frame_format.height,
+                            ),
+                            frame_copy,
                         ))
                     })
                 })
                 .collect::<Vec<_>>();
+
+            // composite_image.expand_palette()
 
             rotate_join_handles
                 .into_iter()
@@ -529,21 +531,27 @@ impl WayshotConnection {
                 .flatten()
                 .fold(
                     None,
-                    |possible_overlayed_image_or_error: Option<Result<_>>, image: Result<_>| {
-                        if let Some(overlayed_image_or_error) = possible_overlayed_image_or_error {
-                            if let Ok(mut overlayed_image) = overlayed_image_or_error {
-                                if let Ok(image) = image {
-                                    replace(&mut overlayed_image, &image, 0, 0);
-                                    Some(Ok(overlayed_image))
-                                } else {
-                                    Some(image)
-                                }
-                            } else {
-                                Some(image)
-                            }
-                        } else {
-                            Some(image)
-                        }
+                    |composite_image: Option<Result<_>>, image: Result<_>| {
+                        // Default to an empty image. This way we know there was an image.s
+                        let composite_image = composite_image.unwrap_or_else(|| {
+                            Ok(RgbaImage::from_pixel(
+                                width,
+                                height,
+                                Rgba([0 as u8, 0 as u8, 0 as u8, 255 as u8]),
+                            ))
+                        });
+
+                        Some(|| -> Result<_> {
+                            let mut composite_image = composite_image?;
+                            let (image, frame_copy) = image?;
+                            replace(
+                                &mut composite_image,
+                                &image,
+                                frame_copy.position.0 - capture_region.x_coordinate as i64,
+                                frame_copy.position.1 - capture_region.y_coordinate as i64,
+                            );
+                            Ok(composite_image)
+                        }())
                     },
                 )
                 .ok_or_else(|| {
@@ -560,7 +568,7 @@ impl WayshotConnection {
         cursor_overlay: bool,
     ) -> Result<RgbaImage> {
         let (frame_copy, frame_guard) = self.capture_frame_copy(cursor_overlay, output_info)?;
-        frame_copy.try_into()
+        (&frame_copy).try_into()
     }
 
     /// Take a screenshot from all of the specified outputs.

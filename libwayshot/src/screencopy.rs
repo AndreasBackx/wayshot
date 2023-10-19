@@ -11,6 +11,7 @@ use nix::{
     sys::{memfd, mman, stat},
     unistd,
 };
+use tracing::instrument;
 use wayland_client::protocol::{
     wl_buffer::WlBuffer, wl_output, wl_shm::Format, wl_shm_pool::WlShmPool,
 };
@@ -39,6 +40,7 @@ pub struct FrameFormat {
     pub stride: u32,
 }
 
+#[instrument(skip(frame_mmap))]
 fn create_image_buffer<P>(
     frame_format: &FrameFormat,
     frame_mmap: &MmapMut,
@@ -46,6 +48,7 @@ fn create_image_buffer<P>(
 where
     P: Pixel<Subpixel = u8>,
 {
+    tracing::debug!("Creating image buffer");
     ImageBuffer::from_vec(frame_format.width, frame_format.height, frame_mmap.to_vec())
         .ok_or(Error::BufferTooSmall)
 }
@@ -58,12 +61,13 @@ pub struct FrameCopy {
     pub frame_color_type: ColorType,
     pub frame_mmap: MmapMut,
     pub transform: wl_output::Transform,
+    pub position: (i64, i64),
 }
 
-impl TryFrom<FrameCopy> for RgbaImage {
+impl TryFrom<&FrameCopy> for RgbaImage {
     type Error = Error;
 
-    fn try_from(value: FrameCopy) -> Result<Self> {
+    fn try_from(value: &FrameCopy) -> Result<Self> {
         Ok(match value.frame_color_type {
             ColorType::Rgb8 | ColorType::Rgba8 => {
                 create_image_buffer(&value.frame_format, &value.frame_mmap)?

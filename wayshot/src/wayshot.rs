@@ -32,16 +32,15 @@ where
 fn main() -> Result<(), Box<dyn Error>> {
     let args = clap::set_flags().get_matches();
     let level = if args.get_flag("debug") {
-        Level::TRACE
+        Level::DEBUG
     } else {
-        Level::INFO
+        Level::WARN
     };
     tracing_subscriber::fmt()
         .with_max_level(level)
         .with_writer(std::io::stderr)
         .init();
 
-    info!("Starting");
     let extension = if let Some(extension) = args.get_one::<String>("extension") {
         let ext = extension.trim().to_lowercase();
         tracing::debug!("Using custom extension: {:#?}", ext);
