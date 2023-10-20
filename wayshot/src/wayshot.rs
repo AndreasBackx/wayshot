@@ -1,16 +1,17 @@
 use std::{
     error::Error,
     io::{stdout, BufWriter, Cursor, Write},
-    process::exit,
+    process::{exit, Command},
 };
 
+use eyre::Context;
 use libwayshot::WayshotConnection;
 
 mod clap;
 mod utils;
 
 use dialoguer::{theme::ColorfulTheme, FuzzySelect};
-use tracing::{info, Level};
+use tracing::Level;
 
 use crate::utils::EncodingFormat;
 
@@ -85,15 +86,27 @@ fn main() -> Result<(), Box<dyn Error>> {
         cursor_overlay = true;
     }
 
-    // let image_buffer = wayshot_conn.screenshot_interactive(cursor_overlay)?;
+    // let freeze_callback =
 
     let image_buffer = if let Some(slurp_region) = args.get_one::<String>("slurp") {
-        if let Some(region) = utils::parse_geometry(slurp_region) {
-            wayshot_conn.screenshot(region, cursor_overlay, true)?
-        } else {
-            tracing::error!("Invalid geometry specification");
-            exit(1);
-        }
+        wayshot_conn.screenshot(
+            region,
+            cursor_overlay,
+            Some(|| {
+                let slurp_output = Command::new("slurp")
+                    .args(slurp_region.split(" "))
+                    .output()?
+                    .stdout;
+
+                utils::parse_geometry(&String::from_utf8(slurp_output)?)
+            }),
+        )?
+        // if let Some(region) = utils::parse_geometry(slurp_region) {
+
+        // } else {
+        //     tracing::error!("Invalid geometry specification");
+        //     exit(1);
+        // }
     } else if let Some(output_name) = args.get_one::<String>("output") {
         let outputs = wayshot_conn.get_all_outputs();
         if let Some(output) = outputs.iter().find(|output| &output.name == output_name) {
