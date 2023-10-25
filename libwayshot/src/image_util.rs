@@ -1,13 +1,15 @@
 use image::RgbaImage;
 use wayland_client::protocol::wl_output::Transform;
 
+#[tracing::instrument(skip(image))]
 pub(crate) fn rotate_image_buffer(
     image: RgbaImage,
     transform: Transform,
     width: u32,
     height: u32,
 ) -> RgbaImage {
-    let final_buffer = match transform {
+    tracing::debug!("Rotating image buffer");
+    match transform {
         Transform::_90 => image::imageops::rotate90(&image),
         Transform::_180 => image::imageops::rotate180(&image),
         Transform::_270 => image::imageops::rotate270(&image),
@@ -25,16 +27,5 @@ pub(crate) fn rotate_image_buffer(
             image::imageops::rotate270(&flipped_buffer)
         }
         _ => image,
-    };
-
-    if final_buffer.dimensions() == (width, height) {
-        return final_buffer;
     }
-
-    image::imageops::resize(
-        &final_buffer,
-        width,
-        height,
-        image::imageops::FilterType::Gaussian,
-    )
 }
