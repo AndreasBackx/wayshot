@@ -32,7 +32,7 @@ where
 fn main() -> Result<(), Box<dyn Error>> {
     let args = clap::set_flags().get_matches();
     let level = if args.get_flag("debug") {
-        Level::TRACE
+        Level::DEBUG
     } else {
         Level::INFO
     };
