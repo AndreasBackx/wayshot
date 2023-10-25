@@ -28,5 +28,5 @@ pub enum Error {
     #[error("Cannot find required wayland protocol")]
     ProtocolNotFound(String),
     #[error("error occurred in freeze callback")]
-    FreezeCallbackError(#[from] Box<dyn std::error::Error + Send>),
+    FreezeCallbackError,
 }

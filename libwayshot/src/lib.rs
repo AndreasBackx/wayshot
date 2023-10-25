@@ -8,31 +8,29 @@ mod dispatch;
 mod error;
 mod image_util;
 pub mod output;
+mod region;
 mod screencopy;
 
 use std::{
     collections::HashSet,
-    convert::Infallible,
     fs::File,
     os::fd::AsFd,
-    process::{exit, Command},
+    process::exit,
     sync::atomic::{AtomicBool, Ordering},
     thread,
 };
 
 use dispatch::LayerShellState;
-use image::{
-    imageops::{overlay, replace},
-    ImageBuffer, Rgba, RgbaImage,
-};
+use image::{imageops::replace, Rgba, RgbaImage};
 use memmap2::MmapMut;
+use region::RegionCapturer;
 use screencopy::FrameGuard;
 use tracing::{debug, span, Level};
 use wayland_client::{
     globals::{registry_queue_init, GlobalList},
     protocol::{
         wl_compositor::WlCompositor,
-        wl_output::{Transform, WlOutput},
+        wl_output::WlOutput,
         wl_shm::{self, WlShm},
     },
     Connection, EventQueue,
@@ -58,40 +56,14 @@ use crate::{
     screencopy::{create_shm_fd, FrameCopy, FrameFormat},
 };
 
-pub use crate::error::{Error, Result};
+pub use crate::{
+    error::{Error, Result},
+    region::CaptureRegion,
+};
 
 pub mod reexport {
     use wayland_client::protocol::wl_output;
     pub use wl_output::{Transform, WlOutput};
-}
-
-/// Struct to store region capture details.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct CaptureRegion {
-    /// X coordinate of the area to capture.
-    pub x_coordinate: i32,
-    /// y coordinate of the area to capture.
-    pub y_coordinate: i32,
-    /// Width of the capture area.
-    pub width: i32,
-    /// Height of the capture area.
-    pub height: i32,
-}
-
-impl CaptureRegion {
-    fn overlaps(&self, other: &CaptureRegion) -> bool {
-        let left = self.x_coordinate;
-        let bottom = self.y_coordinate;
-        let right = self.x_coordinate + self.width;
-        let top = self.y_coordinate + self.height;
-
-        let other_left = other.x_coordinate;
-        let other_bottom: i32 = other.y_coordinate;
-        let other_right = other.x_coordinate + other.width;
-        let other_top: i32 = other.y_coordinate + other.height;
-
-        left < other_right && other_left < right && bottom < other_top && other_bottom < top
-    }
 }
 
 /// Struct to store wayland connection and globals list.
@@ -390,15 +362,15 @@ impl WayshotConnection {
 
     pub fn capture_frame_copies(
         &self,
+        outputs: &Vec<OutputInfo>,
         cursor_overlay: bool,
     ) -> Result<Vec<(FrameCopy, FrameGuard, OutputInfo)>> {
         let frame_copies = thread::scope(|scope| -> Result<_> {
-            let join_handles = self
-                .get_all_outputs()
+            let join_handles = outputs
                 .into_iter()
                 .map(|output_info| {
                     scope.spawn(move || {
-                        self.capture_frame_copy(cursor_overlay, output_info).map(
+                        self.capture_frame_copy(cursor_overlay, &output_info).map(
                             |(frame_copy, frame_guard)| {
                                 (frame_copy, frame_guard, output_info.clone())
                             },
@@ -499,39 +471,31 @@ impl WayshotConnection {
     }
 
     /// Take a screenshot from the specified region.
-    pub fn screenshot<F>(
+    fn screenshot_region_capturer(
         &self,
-        capture_region: CaptureRegion,
+        region_capturer: RegionCapturer,
         cursor_overlay: bool,
-        freeze_callback: Option<F>,
-    ) -> Result<RgbaImage>
-    where
-        F: Fn() -> std::result::Result<CaptureRegion, Box<dyn std::error::Error + Send>>,
-    {
-        let frames = self.capture_frame_copies(cursor_overlay)?;
-        let (width, height) = (capture_region.width as u32, capture_region.height as u32);
+    ) -> Result<RgbaImage> {
+        let outputs = if let RegionCapturer::Outputs(ref outputs) = region_capturer {
+            outputs
+        } else {
+            &self.get_all_outputs()
+        };
+        let frames = self.capture_frame_copies(outputs, cursor_overlay)?;
 
-        let selected_region =
-            freeze_callback
-                .and_then(|callback| {
-                    Some(self.overlay_frames(&frames).and_then(|_| {
-                        callback().map_err(|error| Error::FreezeCallbackError(error))
-                    }))
-                })
-                .transpose()?;
+        let capture_region: CaptureRegion = match region_capturer {
+            RegionCapturer::Outputs(ref outputs) => outputs.try_into()?,
+            RegionCapturer::Region(region) => region,
+            RegionCapturer::Freeze(callback) => {
+                self.overlay_frames(&frames).and_then(|_| callback())?
+            }
+        };
 
         thread::scope(|scope| {
             let rotate_join_handles = frames
                 .into_iter()
-                // Filter out the frames that do not contain the selected region.
-                .filter(|(frame_copy, _, _)| {
-                    if let Some(selected_region) = &selected_region {
-                        return selected_region.overlaps(&capture_region);
-                    } else {
-                        // If no selected region, select everything.
-                        true
-                    }
-                })
+                // Filter out the frames that do not contain the capture region.
+                .filter(|(frame_copy, _, _)| capture_region.overlaps(&frame_copy.into()))
                 .map(|(frame_copy, _, _)| {
                     scope.spawn(move || {
                         let image = (&frame_copy).try_into()?;
@@ -558,8 +522,8 @@ impl WayshotConnection {
                         // Default to a transparent image.
                         let composite_image = composite_image.unwrap_or_else(|| {
                             Ok(RgbaImage::from_pixel(
-                                width,
-                                height,
+                                capture_region.width as u32,
+                                capture_region.height as u32,
                                 Rgba([0 as u8, 0 as u8, 0 as u8, 255 as u8]),
                             ))
                         });
@@ -584,13 +548,31 @@ impl WayshotConnection {
         })
     }
 
+    /// Take a screenshot from the specified region.
+    pub fn screenshot(
+        &self,
+        capture_region: CaptureRegion,
+        cursor_overlay: bool,
+    ) -> Result<RgbaImage> {
+        self.screenshot_region_capturer(RegionCapturer::Region(capture_region), cursor_overlay)
+    }
+
+    /// Take a screenshot, overlay the screenshot, run the callback, and then
+    /// unfreeze the screenshot and return the selected region.
+    pub fn screenshot_freeze(
+        &self,
+        callback: Box<dyn Fn() -> Result<CaptureRegion>>,
+        cursor_overlay: bool,
+    ) -> Result<RgbaImage> {
+        self.screenshot_region_capturer(RegionCapturer::Freeze(callback), cursor_overlay)
+    }
     /// shot one ouput
     pub fn screenshot_single_output(
         &self,
         output_info: &OutputInfo,
         cursor_overlay: bool,
     ) -> Result<RgbaImage> {
-        let (frame_copy, frame_guard) = self.capture_frame_copy(cursor_overlay, output_info)?;
+        let (frame_copy, _) = self.capture_frame_copy(cursor_overlay, output_info)?;
         (&frame_copy).try_into()
     }
 
@@ -604,38 +586,7 @@ impl WayshotConnection {
             return Err(Error::NoOutputs);
         }
 
-        let x1 = outputs
-            .iter()
-            .map(|output| output.dimensions.x)
-            .min()
-            .unwrap();
-        let y1 = outputs
-            .iter()
-            .map(|output| output.dimensions.y)
-            .min()
-            .unwrap();
-        let x2 = outputs
-            .iter()
-            .map(|output| output.dimensions.x + output.dimensions.width)
-            .max()
-            .unwrap();
-        let y2 = outputs
-            .iter()
-            .map(|output| output.dimensions.y + output.dimensions.height)
-            .max()
-            .unwrap();
-        let capture_region = CaptureRegion {
-            x_coordinate: x1,
-            y_coordinate: y1,
-            width: x2 - x1,
-            height: y2 - y1,
-        };
-
-        self.screenshot::<fn() -> std::result::Result<CaptureRegion, Box<dyn std::error::Error + Send>>>(
-            capture_region,
-            cursor_overlay,
-            None,
-        )
+        self.screenshot_region_capturer(RegionCapturer::Outputs(outputs.clone()), cursor_overlay)
     }
 
     /// Take a screenshot from all accessible outputs.

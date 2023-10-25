@@ -247,12 +247,12 @@ delegate_noop!(LayerShellState: ignore WlBuffer);
 
 impl wayland_client::Dispatch<ZwlrLayerShellV1, ()> for LayerShellState {
     fn event(
-        state: &mut Self,
-        proxy: &ZwlrLayerShellV1,
+        _state: &mut Self,
+        _proxy: &ZwlrLayerShellV1,
         event: <ZwlrLayerShellV1 as wayland_client::Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &QueueHandle<Self>,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
     ) {
         match event {
             _ => todo!(),
@@ -261,12 +261,12 @@ impl wayland_client::Dispatch<ZwlrLayerShellV1, ()> for LayerShellState {
 }
 impl wayland_client::Dispatch<WlSurface, ()> for LayerShellState {
     fn event(
-        state: &mut Self,
-        proxy: &WlSurface,
+        _state: &mut Self,
+        _proxy: &WlSurface,
         event: <WlSurface as wayland_client::Proxy>::Event,
-        data: &(),
-        conn: &Connection,
-        qhandle: &QueueHandle<Self>,
+        _data: &(),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
     ) {
         debug!("WlSurface event: {:?}", event);
     }
@@ -278,14 +278,14 @@ impl wayland_client::Dispatch<ZwlrLayerSurfaceV1, WlOutput> for LayerShellState 
         proxy: &ZwlrLayerSurfaceV1,
         event: <ZwlrLayerSurfaceV1 as wayland_client::Proxy>::Event,
         data: &WlOutput,
-        conn: &Connection,
-        qhandle: &QueueHandle<Self>,
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
     ) {
         match event {
             zwlr_layer_surface_v1::Event::Configure {
                 serial,
-                width,
-                height,
+                width: _,
+                height: _,
             } => {
                 debug!("Acking configure");
                 state.configured_outputs.insert(data.clone());
