@@ -1,12 +1,13 @@
 use wayland_client::protocol::wl_output::Transform;
 
-use crate::error::Error;
+use crate::error::{Error, Result};
 use crate::output::OutputInfo;
 use crate::screencopy::FrameCopy;
 
 pub enum RegionCapturer {
     Outputs(Vec<OutputInfo>),
     Region(CaptureRegion),
+    Freeze(Box<dyn Fn() -> Result<CaptureRegion>>),
 }
 
 /// Struct to store region capture details.
