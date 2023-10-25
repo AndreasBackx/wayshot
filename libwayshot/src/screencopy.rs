@@ -11,9 +11,23 @@ use nix::{
     sys::{memfd, mman, stat},
     unistd,
 };
-use wayland_client::protocol::{wl_output, wl_shm::Format};
+use wayland_client::protocol::{
+    wl_buffer::WlBuffer, wl_output, wl_shm::Format, wl_shm_pool::WlShmPool,
+};
 
 use crate::{Error, Result};
+
+pub struct FrameGuard {
+    pub buffer: WlBuffer,
+    pub shm_pool: WlShmPool,
+}
+
+impl Drop for FrameGuard {
+    fn drop(&mut self) {
+        self.buffer.destroy();
+        self.shm_pool.destroy();
+    }
+}
 
 /// Type of frame supported by the compositor. For now we only support Argb8888, Xrgb8888, and
 /// Xbgr8888.
@@ -46,6 +60,7 @@ pub struct FrameCopy {
     pub frame_color_type: ColorType,
     pub frame_mmap: MmapMut,
     pub transform: wl_output::Transform,
+    pub position: (i64, i64),
 }
 
 impl TryFrom<&FrameCopy> for RgbaImage {

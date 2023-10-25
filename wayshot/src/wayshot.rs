@@ -1,10 +1,11 @@
 use std::{
     error::Error,
     io::{stdout, BufWriter, Cursor, Write},
-    process::exit,
+    process::{exit, Command},
 };
 
-use libwayshot::WayshotConnection;
+use eyre::Result;
+use libwayshot::{CaptureRegion, WayshotConnection};
 
 mod clap;
 mod utils;
@@ -86,12 +87,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let image_buffer = if let Some(slurp_region) = args.get_one::<String>("slurp") {
-        if let Some(region) = utils::parse_geometry(slurp_region) {
-            wayshot_conn.screenshot(region, cursor_overlay)?
-        } else {
-            tracing::error!("Invalid geometry specification");
-            exit(1);
-        }
+        let slurp_region = slurp_region.clone();
+        wayshot_conn.screenshot_freeze(
+            Box::new(move || {
+                || -> Result<CaptureRegion> {
+                    let slurp_output = Command::new("slurp")
+                        .args(slurp_region.split(" "))
+                        .output()?
+                        .stdout;
+
+                    utils::parse_geometry(&String::from_utf8(slurp_output)?)
+                }()
+                .map_err(|_| libwayshot::Error::FreezeCallbackError)
+            }),
+            cursor_overlay,
+        )?
     } else if let Some(output_name) = args.get_one::<String>("output") {
         let outputs = wayshot_conn.get_all_outputs();
         if let Some(output) = outputs.iter().find(|output| &output.name == output_name) {
