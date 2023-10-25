@@ -8,15 +8,14 @@ pub fn set_flags() -> Command {
         .arg(
             arg!(-d - -debug)
                 .required(false)
-                .conflicts_with("stdout")
                 .action(ArgAction::SetTrue)
                 .help("Enable debug mode"),
         )
         .arg(
-            arg!(-s --slurp <GEOMETRY>)
+            arg!(-s --slurp <SLURP_ARGS>)
                 .required(false)
                 .action(ArgAction::Set)
-                .help("Choose a portion of your display to screenshot using slurp"),
+                .help("Arguments to call slurp with for selecting a region"),
         )
         .arg(
             arg!(-f - -file <FILE_PATH>)
